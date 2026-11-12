@@ -1,0 +1,10 @@
+{
+  "name": "toon-renderer",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "playwright": "1.48.2",
+    "three": "0.160.0"
+  }
+}

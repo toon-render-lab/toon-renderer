@@ -1,0 +1,138 @@
+name: render
+run-name: render ${{ inputs.job }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "job id (branch job/<id> holds the encrypted input bundle)"
+        required: true
+        type: string
+      shards:
+        description: "parallel frame jobs (1-12)"
+        required: false
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: render-${{ inputs.job }}
+  cancel-in-progress: false
+
+env:
+  JOB: ${{ inputs.job }}
+  SHARDS: ${{ inputs.shards }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        run: |
+          [[ "$JOB" =~ ^[a-z0-9]{6,40}$ ]] || { echo "bad job id"; exit 1; }
+          [[ "$SHARDS" =~ ^([1-9]|1[0-2])$ ]] || { echo "bad shards"; exit 1; }
+          echo "matrix=[$(seq -s, 0 $((SHARDS - 1)))]" >> "$GITHUB_OUTPUT"
+
+  frames:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: true
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: job/${{ inputs.job }}
+          path: in
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: tools
+        run: |
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium
+          python3 -m pip install --quiet --break-system-packages numpy Pillow
+      - name: unpack
+        env:
+          RENDER_KEY: ${{ secrets.RENDER_KEY }}
+        run: bash tools/unpack.sh in/in.gpg work
+      - name: render
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          ln -s "$PWD/node_modules" work/node_modules
+          mkdir -p frames
+          t0=$(date +%s)
+          bash work/render.sh "$PWD/frames" "$SHARD" "$SHARDS" > render.log 2>&1 || { echo "render failed (log kept inside the encrypted artifact)"; fail=1; }
+          n=$(find frames -type f | wc -l)
+          echo "shard $SHARD: $n frames in $(( $(date +%s) - t0 )) s"
+          mv render.log frames/_render_$SHARD.log
+          exit ${fail:-0}
+      - name: pack
+        if: always()
+        env:
+          RENDER_KEY: ${{ secrets.RENDER_KEY }}
+        run: bash tools/pack.sh frames frames.gpg
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: frames-${{ matrix.shard }}
+          path: frames.gpg
+          retention-days: 1
+          compression-level: 0
+
+  finish:
+    needs: frames
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: job/${{ inputs.job }}
+          path: in
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: frames-*
+          path: parts
+      - name: tools
+        run: |
+          command -v ffmpeg >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg; }
+          python3 -m pip install --quiet --break-system-packages numpy Pillow
+      - name: unpack
+        env:
+          RENDER_KEY: ${{ secrets.RENDER_KEY }}
+        run: |
+          bash tools/unpack.sh in/in.gpg work
+          mkdir -p frames
+          for p in parts/*/frames.gpg; do bash tools/unpack.sh "$p" frames; done
+      - name: finish
+        run: |
+          mkdir -p out
+          t0=$(date +%s)
+          bash work/finish.sh "$PWD/frames" "$PWD/out" > finish.log 2>&1 || { echo "finish failed (log kept inside the encrypted artifact)"; fail=1; }
+          echo "finish: $(( $(date +%s) - t0 )) s, $(du -sm out | cut -f1) MB"
+          mv finish.log out/_finish.log
+          cp frames/_render_*.log out/ 2>/dev/null || true
+          exit ${fail:-0}
+      - name: pack
+        if: always()
+        env:
+          RENDER_KEY: ${{ secrets.RENDER_KEY }}
+        run: bash tools/pack.sh out out.gpg
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: out
+          path: out.gpg
+          retention-days: 1
+          compression-level: 0
